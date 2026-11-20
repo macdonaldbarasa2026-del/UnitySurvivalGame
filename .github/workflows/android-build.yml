@@ -1,0 +1,147 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate project structure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run project validation
+        run: python3 scripts/validate_project.py
+
+      - name: Install Mono C# compiler
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mono-mcs
+
+      - name: Compile C# scripts against Unity API stubs
+        run: bash scripts/compile_check.sh
+
+  build:
+    name: Build Android APKs
+    runs-on: ubuntu-latest
+    needs: validate
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Verify Unity license is configured
+        env:
+          HAS_LICENSE: ${{ secrets.UNITY_LICENSE != '' }}
+        run: |
+          if [ "$HAS_LICENSE" != "true" ]; then
+            echo "::error::UNITY_LICENSE secret is missing. Add your Unity Personal license (.ulf contents) as the UNITY_LICENSE repository secret. See README.md."
+            exit 1
+          fi
+
+      - uses: actions/cache@v4
+        with:
+          path: Library
+          key: Library-Android-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
+          restore-keys: |
+            Library-Android-
+
+      - uses: jlumbroso/free-disk-space@v1.3.1
+        continue-on-error: true
+
+      - name: Build debug APK
+        uses: game-ci/unity-builder@v4
+        id: debug-build
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+        with:
+          targetPlatform: Android
+          unityVersion: auto
+          androidExportType: androidPackage
+          buildMethod: SurvivalGame.Editor.CiBuild.BuildDebug
+          androidVersionCode: 1
+
+      - name: Build release APK
+        uses: game-ci/unity-builder@v4
+        id: release-build
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+          ANDROID_KEYSTORE_NAME: ${{ secrets.ANDROID_KEYSTORE_NAME }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          ANDROID_KEYALIAS_NAME: ${{ secrets.ANDROID_KEYALIAS_NAME }}
+          ANDROID_KEYALIAS_PASS: ${{ secrets.ANDROID_KEYALIAS_PASS }}
+        with:
+          targetPlatform: Android
+          unityVersion: auto
+          androidExportType: androidPackage
+          buildMethod: SurvivalGame.Editor.CiBuild.BuildRelease
+          androidVersionCode: 1
+          androidKeystoreName: ${{ secrets.ANDROID_KEYSTORE_NAME }}
+          androidKeystoreBase64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          androidKeystorePass: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          androidKeyaliasName: ${{ secrets.ANDROID_KEYALIAS_NAME }}
+          androidKeyaliasPass: ${{ secrets.ANDROID_KEYALIAS_PASS }}
+
+      - name: Verify APK files
+        run: |
+          set -euo pipefail
+          ls -l build/Android
+          for apk in build/Android/*.apk; do
+            [ -s "$apk" ] || { echo "Empty APK: $apk"; exit 1; }
+            unzip -tq "$apk" >/dev/null
+            echo "Verified ZIP structure: $apk"
+          done
+
+      - name: Upload APK artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unity-survival-apks-${{ github.run_number }}
+          path: |
+            build/Android/*.apk
+            build/Android/*.aab
+          if-no-files-found: warn
+          retention-days: 30
+
+  release:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    needs: [validate, build]
+    if: startsWith(github.ref, 'refs/tags/v') && needs.build.result == 'success'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: unity-survival-apks-${{ github.run_number }}
+          path: apks
+      - name: Create release with APK downloads
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ls -l apks
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "Unity Survival ${GITHUB_REF_NAME}" \
+            --notes "Automated Android build of Unity Survival. Install the APK on an Android 8.0+ device. Use the debug APK for testing and the release APK for general use." \
+            apks/*.apk
